@@ -1,18 +1,17 @@
 import json
 import asyncio
-import time
 from contextlib import asynccontextmanager
 from typing import List, Optional
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, text
 from openai import AsyncOpenAI, APITimeoutError, APIConnectionError, RateLimitError
 import config
 from database import get_db, Product, ProductListing, Platform
-from auth import verify_token, get_current_user_id
+from auth import verify_token
 from limiter import connection_limiter, message_rate_limiter
 from logger import logger
 
@@ -98,8 +97,8 @@ async def search_products_in_db(
     db: AsyncSession,
     keyword: str,
     max_price: float = None,
-    condition: str = None,
     min_price: float = None,
+    condition: str = None,
     free_shipping: bool = None,
 ) -> List[ProductCard]:
     query = (
@@ -193,9 +192,22 @@ SYSTEM_PROMPT = (
 @app.websocket("/api/chat")
 async def websocket_chat(
     websocket: WebSocket,
-    token: str,
     db: AsyncSession = Depends(get_db),
 ):
+    await websocket.accept()
+
+    try:
+        auth_raw = await asyncio.wait_for(websocket.receive_text(), timeout=15)
+    except asyncio.TimeoutError:
+        await websocket.close(code=1008, reason="Authentication timeout.")
+        return
+
+    try:
+        auth_data = json.loads(auth_raw)
+        token = auth_data.get("token", "")
+    except (json.JSONDecodeError, AttributeError):
+        token = auth_raw.strip()
+
     try:
         user_id = verify_token(token)
     except ValueError as e:
@@ -212,7 +224,6 @@ async def websocket_chat(
         logger.warning("Connection limit exceeded", extra={"user_id": user_id})
         return
 
-    await websocket.accept()
     logger.info("WebSocket connected", extra={"user_id": user_id})
 
     conversation_history: list[dict] = []
@@ -248,7 +259,10 @@ async def websocket_chat(
             if len(message) > config.WS_MAX_MESSAGE_LENGTH:
                 await websocket.send_text(
                     ChatResponse(
-                        reply_text=f"Your message is too long. Please keep it under {config.WS_MAX_MESSAGE_LENGTH} characters.",
+                        reply_text=(
+                            f"Your message is too long. "
+                            f"Please keep it under {config.WS_MAX_MESSAGE_LENGTH} characters."
+                        ),
                         products=[],
                     ).model_dump_json()
                 )
@@ -318,7 +332,12 @@ async def websocket_chat(
 
                 try:
                     found_products = await search_products_in_db(
-                        db, keyword, max_price, condition, min_price, free_shipping
+                        db,
+                        keyword=keyword,
+                        max_price=max_price,
+                        min_price=min_price,
+                        condition=condition,
+                        free_shipping=free_shipping,
                     )
                 except Exception as e:
                     logger.error("DB search error", extra={"user_id": user_id, "error": str(e)})
@@ -330,18 +349,52 @@ async def websocket_chat(
                     )
                     continue
 
-                if found_products:
-                    reply_text = f"Here are some {keyword} options I found for you:"
-                else:
-                    reply_text = (
-                        f"Sorry, I couldn't find any '{keyword}' matching your criteria. "
-                        "Try a broader keyword or adjust your filters."
-                    )
-
                 logger.info(
                     "Product search completed",
                     extra={"user_id": user_id, "keyword": keyword, "results": len(found_products)},
                 )
+
+                conversation_history.append({
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": tool_call.id,
+                            "type": "function",
+                            "function": {
+                                "name": tool_call.function.name,
+                                "arguments": tool_call.function.arguments,
+                            },
+                        }
+                    ],
+                })
+                conversation_history.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": json.dumps(
+                        [p.model_dump() for p in found_products], default=str
+                    ),
+                })
+
+                try:
+                    followup = await openai_client.chat.completions.create(
+                        model="gpt-4o-mini",
+                        messages=[
+                            {"role": "system", "content": SYSTEM_PROMPT},
+                            *conversation_history,
+                        ],
+                        temperature=0.4,
+                    )
+                    reply_text = followup.choices[0].message.content or ""
+                except Exception as e:
+                    logger.error("OpenAI follow-up error", extra={"user_id": user_id, "error": str(e)})
+                    if found_products:
+                        reply_text = f"Here are some {keyword} options I found for you:"
+                    else:
+                        reply_text = (
+                            f"Sorry, I couldn't find any '{keyword}' matching your criteria. "
+                            "Try a broader keyword or adjust your filters."
+                        )
 
             else:
                 reply_text     = response_message.content or ""

@@ -33,7 +33,7 @@ class MessageRateLimiter:
 
     async def is_allowed(self, user_id: int) -> bool:
         async with self._lock:
-            now = time.monotonic()
+            now    = time.monotonic()
             cutoff = now - self.window_seconds
             self._history[user_id] = [
                 t for t in self._history[user_id] if t > cutoff
@@ -43,5 +43,6 @@ class MessageRateLimiter:
             self._history[user_id].append(now)
             return True
 
-connection_limiter = ConnectionLimiter()
-message_rate_limiter = MessageRateLimiter(max_messages=30, window_seconds=60)
+
+connection_limiter    = ConnectionLimiter()
+message_rate_limiter  = MessageRateLimiter(max_messages=30, window_seconds=60)

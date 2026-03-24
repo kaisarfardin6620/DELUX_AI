@@ -25,10 +25,17 @@ OPENAI_API_KEY = _require("OPENAI_API_KEY")
 DJANGO_MEDIA_URL = _require("DJANGO_MEDIA_URL")
 
 _raw_origins = _optional("CORS_ALLOWED_ORIGINS", "")
-CORS_ALLOWED_ORIGINS: list[str] = (
-    [o.strip() for o in _raw_origins.split(",") if o.strip()]
-    if _raw_origins else ["*"]
-)
+
+if not _raw_origins:
+    raise RuntimeError(
+        "Required environment variable 'CORS_ALLOWED_ORIGINS' is not set. "
+        "Provide a comma-separated list of allowed origins, e.g.: "
+        "http://localhost:3000,https://yourdomain.com"
+    )
+
+CORS_ALLOWED_ORIGINS: list[str] = [
+    o.strip() for o in _raw_origins.split(",") if o.strip()
+]
 
 WS_MAX_CONNECTIONS_PER_USER = int(_optional("WS_MAX_CONNECTIONS_PER_USER", "5"))
 WS_MAX_MESSAGE_LENGTH       = int(_optional("WS_MAX_MESSAGE_LENGTH", "2000"))
