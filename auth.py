@@ -8,13 +8,6 @@ security = HTTPBearer()
 
 
 def verify_token(token: str) -> int:
-    """
-    Verify a Django SimpleJWT access token.
-      - Algorithm : HS256
-      - Signing key: SECRET_KEY (identical to Django's SECRET_KEY in .env)
-      - User claim : 'user_id'  (matches SIMPLE_JWT['USER_ID_CLAIM'] in Django settings)
-    Returns the integer user_id on success, raises ValueError on failure.
-    """
     try:
         payload = jwt.decode(token, config.SECRET_KEY, algorithms=["HS256"])
         user_id = payload.get("user_id")
@@ -33,7 +26,6 @@ def verify_token(token: str) -> int:
 def get_current_user_id(
     credentials: HTTPAuthorizationCredentials = Depends(security),
 ) -> int:
-    """FastAPI dependency for HTTP endpoints that require authentication."""
     try:
         return verify_token(credentials.credentials)
     except ValueError as e:

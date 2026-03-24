@@ -6,17 +6,12 @@ import config
 
 
 class ConnectionLimiter:
-    """
-    Tracks active WebSocket connections per user.
-    Prevents a single user from holding too many concurrent connections.
-    """
 
     def __init__(self):
         self._counts: dict[int, int] = defaultdict(int)
         self._lock = asyncio.Lock()
 
     async def acquire(self, user_id: int) -> bool:
-        """Returns True if connection is allowed, False if limit exceeded."""
         async with self._lock:
             if self._counts[user_id] >= config.WS_MAX_CONNECTIONS_PER_USER:
                 return False
@@ -29,10 +24,6 @@ class ConnectionLimiter:
 
 
 class MessageRateLimiter:
-    """
-    Simple sliding-window rate limiter per user.
-    Default: max 30 messages per 60 seconds.
-    """
 
     def __init__(self, max_messages: int = 30, window_seconds: int = 60):
         self.max_messages   = max_messages
@@ -44,7 +35,6 @@ class MessageRateLimiter:
         async with self._lock:
             now = time.monotonic()
             cutoff = now - self.window_seconds
-            # Drop timestamps outside the window
             self._history[user_id] = [
                 t for t in self._history[user_id] if t > cutoff
             ]
@@ -53,7 +43,5 @@ class MessageRateLimiter:
             self._history[user_id].append(now)
             return True
 
-
-# Module-level singletons shared across all WebSocket connections
 connection_limiter = ConnectionLimiter()
 message_rate_limiter = MessageRateLimiter(max_messages=30, window_seconds=60)

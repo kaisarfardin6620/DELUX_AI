@@ -3,7 +3,6 @@ import asyncio
 import time
 from contextlib import asynccontextmanager
 from typing import List, Optional
-
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -11,7 +10,6 @@ from pydantic import BaseModel, field_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, text
 from openai import AsyncOpenAI, APITimeoutError, APIConnectionError, RateLimitError
-
 import config
 from database import get_db, Product, ProductListing, Platform
 from auth import verify_token, get_current_user_id
@@ -19,14 +17,12 @@ from limiter import connection_limiter, message_rate_limiter
 from logger import logger
 
 
-# ── OpenAI client ─────────────────────────────────────────────────────────────
 openai_client = AsyncOpenAI(
     api_key=config.OPENAI_API_KEY,
     timeout=config.OPENAI_TIMEOUT_SECONDS,
 )
 
 
-# ── Lifespan (startup / shutdown) ─────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Chatbot service starting up", extra={"env": "production"})
@@ -34,16 +30,14 @@ async def lifespan(app: FastAPI):
     logger.info("Chatbot service shutting down")
 
 
-# ── App ───────────────────────────────────────────────────────────────────────
 app = FastAPI(
     title="Dealnux Chatbot API",
     version="1.0.0",
-    docs_url=None,        # disable Swagger UI in production
-    redoc_url=None,       # disable ReDoc in production
+    docs_url=None,
+    redoc_url=None,
     lifespan=lifespan,
 )
 
-# ── CORS ──────────────────────────────────────────────────────────────────────
 app.add_middleware(
     CORSMiddleware,
     allow_origins=config.CORS_ALLOWED_ORIGINS,
@@ -53,20 +47,14 @@ app.add_middleware(
 )
 
 
-# ── Global exception handler ──────────────────────────────────────────────────
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
     logger.error("Unhandled exception", extra={"path": request.url.path, "error": str(exc)})
     return JSONResponse(status_code=500, content={"detail": "Internal server error"})
 
 
-# ── Health check ──────────────────────────────────────────────────────────────
 @app.get("/health")
 async def health_check(db: AsyncSession = Depends(get_db)):
-    """
-    Used by load balancers and container orchestrators (Docker, Kubernetes) to
-    verify the service is alive and the DB connection is working.
-    """
     try:
         await db.execute(text("SELECT 1"))
         return {"status": "ok", "db": "connected"}
@@ -75,7 +63,6 @@ async def health_check(db: AsyncSession = Depends(get_db)):
         raise HTTPException(status_code=503, detail="Database unavailable")
 
 
-# ── Schemas ───────────────────────────────────────────────────────────────────
 class ProductCard(BaseModel):
     id: int
     title: str
@@ -95,29 +82,18 @@ class ChatResponse(BaseModel):
     products: List[ProductCard] = []
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
 def build_image_url(relative_path: str | None) -> str | None:
-    """
-    Django stores image paths as relative strings (e.g. 'seller_products/photo.jpg').
-    Reconstruct the full URL using DJANGO_MEDIA_URL from config.
-    """
     if not relative_path:
         return None
     return config.DJANGO_MEDIA_URL.rstrip("/") + "/" + relative_path.lstrip("/")
 
 
 def trim_history(history: list[dict], max_turns: int) -> list[dict]:
-    """
-    Keep only the last N turns to prevent the context window growing unbounded.
-    Each "turn" = 1 user message + 1 assistant reply = 2 entries.
-    """
     max_entries = max_turns * 2
     if len(history) > max_entries:
         return history[-max_entries:]
     return history
 
-
-# ── Product search ────────────────────────────────────────────────────────────
 async def search_products_in_db(
     db: AsyncSession,
     keyword: str,
@@ -168,7 +144,6 @@ async def search_products_in_db(
     return products
 
 
-# ── OpenAI tool definitions ───────────────────────────────────────────────────
 TOOLS = [
     {
         "type": "function",
@@ -215,14 +190,12 @@ SYSTEM_PROMPT = (
 )
 
 
-# ── WebSocket endpoint ────────────────────────────────────────────────────────
 @app.websocket("/api/chat")
 async def websocket_chat(
     websocket: WebSocket,
     token: str,
     db: AsyncSession = Depends(get_db),
 ):
-    # ── 1. Authenticate ───────────────────────────────────────────────────────
     try:
         user_id = verify_token(token)
     except ValueError as e:
@@ -230,7 +203,6 @@ async def websocket_chat(
         logger.warning("WebSocket auth failed", extra={"reason": str(e)})
         return
 
-    # ── 2. Connection limit per user ──────────────────────────────────────────
     allowed = await connection_limiter.acquire(user_id)
     if not allowed:
         await websocket.close(
@@ -247,15 +219,12 @@ async def websocket_chat(
 
     try:
         while True:
-            # ── 3. Receive message ────────────────────────────────────────────
             try:
                 raw = await asyncio.wait_for(websocket.receive_text(), timeout=300)
             except asyncio.TimeoutError:
-                # No message for 5 minutes — close the connection to free resources
                 await websocket.close(code=1001, reason="Session timed out due to inactivity.")
                 break
 
-            # ── 4. Rate limit ─────────────────────────────────────────────────
             if not await message_rate_limiter.is_allowed(user_id):
                 await websocket.send_text(
                     ChatResponse(
@@ -265,7 +234,6 @@ async def websocket_chat(
                 )
                 continue
 
-            # ── 5. Parse & validate input ─────────────────────────────────────
             try:
                 msg_data = json.loads(raw)
                 message = msg_data.get("message", raw)
@@ -288,13 +256,11 @@ async def websocket_chat(
 
             logger.info("Message received", extra={"user_id": user_id, "length": len(message)})
 
-            # ── 6. Append user message & trim history ─────────────────────────
             conversation_history.append({"role": "user", "content": message})
             conversation_history = trim_history(
                 conversation_history, config.WS_MAX_HISTORY_TURNS
             )
 
-            # ── 7. Call OpenAI ────────────────────────────────────────────────
             try:
                 response = await openai_client.chat.completions.create(
                     model="gpt-4o-mini",
@@ -334,7 +300,6 @@ async def websocket_chat(
                 )
                 continue
 
-            # ── 8. Handle response ────────────────────────────────────────────
             response_message = response.choices[0].message
 
             if response_message.tool_calls:
@@ -382,10 +347,8 @@ async def websocket_chat(
                 reply_text     = response_message.content or ""
                 found_products = []
 
-            # ── 9. Append assistant reply to history ──────────────────────────
             conversation_history.append({"role": "assistant", "content": reply_text})
 
-            # ── 10. Send response to client ───────────────────────────────────
             await websocket.send_text(
                 ChatResponse(reply_text=reply_text, products=found_products).model_dump_json()
             )
@@ -395,5 +358,4 @@ async def websocket_chat(
     except Exception as e:
         logger.error("Unexpected WebSocket error", extra={"user_id": user_id, "error": str(e)})
     finally:
-        # Always release the connection slot, even if an exception occurred
         await connection_limiter.release(user_id)
