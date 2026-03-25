@@ -2,7 +2,7 @@ import json
 import asyncio
 from contextlib import asynccontextmanager
 from typing import List, Optional
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, HTTPException, Request
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, HTTPException, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -10,11 +10,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, text
 from openai import AsyncOpenAI, APITimeoutError, APIConnectionError, RateLimitError
 import config
-from database import get_db, Product, ProductListing, Platform
+from database import get_db, AsyncSessionLocal, Product, ProductListing, Platform
 from auth import verify_token
-from limiter import connection_limiter, message_rate_limiter
+from limiter import connection_limiter, message_rate_limiter, redis_client
 from logger import logger
-
 
 openai_client = AsyncOpenAI(
     api_key=config.OPENAI_API_KEY,
@@ -26,6 +25,7 @@ openai_client = AsyncOpenAI(
 async def lifespan(app: FastAPI):
     logger.info("Chatbot service starting up", extra={"env": "production"})
     yield
+    await redis_client.aclose()
     logger.info("Chatbot service shutting down")
 
 
@@ -78,7 +78,7 @@ class ProductCard(BaseModel):
 
 class ChatResponse(BaseModel):
     reply_text: str
-    products: List[ProductCard] = []
+    products: List[ProductCard] =[]
 
 
 def build_image_url(relative_path: str | None) -> str | None:
@@ -125,7 +125,7 @@ async def search_products_in_db(
     result = await db.execute(query)
     rows = result.all()
 
-    products = []
+    products =[]
     for prod, listing, platform in rows:
         products.append(ProductCard(
             id=prod.id,
@@ -143,7 +143,7 @@ async def search_products_in_db(
     return products
 
 
-TOOLS = [
+TOOLS =[
     {
         "type": "function",
         "function": {
@@ -166,7 +166,7 @@ TOOLS = [
                     },
                     "condition": {
                         "type": "string",
-                        "enum": ["NEW", "USED", "REFURBISHED", "OPEN_BOX"],
+                        "enum":["NEW", "USED", "REFURBISHED", "OPEN_BOX"],
                         "description": "Product condition filter",
                     },
                     "free_shipping": {
@@ -192,21 +192,22 @@ SYSTEM_PROMPT = (
 @app.websocket("/api/chat")
 async def websocket_chat(
     websocket: WebSocket,
-    db: AsyncSession = Depends(get_db),
+    token: str = Query(default=None),
 ):
     await websocket.accept()
 
-    try:
-        auth_raw = await asyncio.wait_for(websocket.receive_text(), timeout=15)
-    except asyncio.TimeoutError:
-        await websocket.close(code=1008, reason="Authentication timeout.")
-        return
-
-    try:
-        auth_data = json.loads(auth_raw)
-        token = auth_data.get("token", "")
-    except (json.JSONDecodeError, AttributeError):
-        token = auth_raw.strip()
+    # If token not in query params, fall back to first message
+    if not token:
+        try:
+            auth_raw = await asyncio.wait_for(websocket.receive_text(), timeout=15)
+        except asyncio.TimeoutError:
+            await websocket.close(code=1008, reason="Authentication timeout.")
+            return
+        try:
+            auth_data = json.loads(auth_raw)
+            token = auth_data.get("token", "")
+        except (json.JSONDecodeError, AttributeError):
+            token = auth_raw.strip()
 
     try:
         user_id = verify_token(token)
@@ -226,7 +227,7 @@ async def websocket_chat(
 
     logger.info("WebSocket connected", extra={"user_id": user_id})
 
-    conversation_history: list[dict] = []
+    conversation_history: list[dict] =[]
 
     try:
         while True:
@@ -331,14 +332,15 @@ async def websocket_chat(
                 free_shipping = args.get("free_shipping")
 
                 try:
-                    found_products = await search_products_in_db(
-                        db,
-                        keyword=keyword,
-                        max_price=max_price,
-                        min_price=min_price,
-                        condition=condition,
-                        free_shipping=free_shipping,
-                    )
+                    async with AsyncSessionLocal() as db_session:
+                        found_products = await search_products_in_db(
+                            db_session,
+                            keyword=keyword,
+                            max_price=max_price,
+                            min_price=min_price,
+                            condition=condition,
+                            free_shipping=free_shipping,
+                        )
                 except Exception as e:
                     logger.error("DB search error", extra={"user_id": user_id, "error": str(e)})
                     await websocket.send_text(
@@ -357,7 +359,7 @@ async def websocket_chat(
                 conversation_history.append({
                     "role": "assistant",
                     "content": None,
-                    "tool_calls": [
+                    "tool_calls":[
                         {
                             "id": tool_call.id,
                             "type": "function",
@@ -398,7 +400,7 @@ async def websocket_chat(
 
             else:
                 reply_text     = response_message.content or ""
-                found_products = []
+                found_products =[]
 
             conversation_history.append({"role": "assistant", "content": reply_text})
 

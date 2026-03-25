@@ -19,27 +19,21 @@ DB_PORT     = _optional("DB_PORT", "5432")
 DB_NAME     = _require("DB_NAME")
 
 SECRET_KEY  = _require("SECRET_KEY")
-
 OPENAI_API_KEY = _require("OPENAI_API_KEY")
-
 DJANGO_MEDIA_URL = _require("DJANGO_MEDIA_URL")
 
+REDIS_URL = _optional("REDIS_URL", "redis://redis:6379/0")
+
 _raw_origins = _optional("CORS_ALLOWED_ORIGINS", "")
-
 if not _raw_origins:
-    raise RuntimeError(
-        "Required environment variable 'CORS_ALLOWED_ORIGINS' is not set. "
-        "Provide a comma-separated list of allowed origins, e.g.: "
-        "http://localhost:3000,https://yourdomain.com"
-    )
+    raise RuntimeError("Required environment variable 'CORS_ALLOWED_ORIGINS' is not set.")
 
-CORS_ALLOWED_ORIGINS: list[str] = [
-    o.strip() for o in _raw_origins.split(",") if o.strip()
-]
+CORS_ALLOWED_ORIGINS: list[str] =[o.strip() for o in _raw_origins.split(",") if o.strip()]
 
 WS_MAX_CONNECTIONS_PER_USER = int(_optional("WS_MAX_CONNECTIONS_PER_USER", "5"))
 WS_MAX_MESSAGE_LENGTH       = int(_optional("WS_MAX_MESSAGE_LENGTH", "2000"))
 WS_MAX_HISTORY_TURNS        = int(_optional("WS_MAX_HISTORY_TURNS", "20"))
+WS_MAX_MESSAGES_PER_MINUTE  = int(_optional("WS_MAX_MESSAGES_PER_MINUTE", "30"))
 
 DB_POOL_SIZE     = int(_optional("DB_POOL_SIZE", "10"))
 DB_MAX_OVERFLOW  = int(_optional("DB_MAX_OVERFLOW", "20"))

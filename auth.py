@@ -1,10 +1,6 @@
 import jwt
-from fastapi import Depends, HTTPException
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
 import config
-
-security = HTTPBearer()
 
 
 def verify_token(token: str) -> int:
@@ -21,12 +17,3 @@ def verify_token(token: str) -> int:
         raise ValueError("Token has expired. Please log in again.")
     except jwt.InvalidTokenError as e:
         raise ValueError(f"Invalid token: {e}")
-
-
-def get_current_user_id(
-    credentials: HTTPAuthorizationCredentials = Depends(security),
-) -> int:
-    try:
-        return verify_token(credentials.credentials)
-    except ValueError as e:
-        raise HTTPException(status_code=401, detail=str(e))
