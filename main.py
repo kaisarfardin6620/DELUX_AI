@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, text
 from openai import AsyncOpenAI, APITimeoutError, APIConnectionError, RateLimitError
 import config
-from database import get_db, AsyncSessionLocal, Product, ProductListing, Platform
+from database import get_db, AsyncSessionLocal, Product, ProductListing, Platform, get_user_profile
 from auth import verify_token
 from limiter import connection_limiter, message_rate_limiter, redis_client
 from logger import logger
@@ -225,7 +225,32 @@ async def websocket_chat(
         logger.warning("Connection limit exceeded", extra={"user_id": user_id})
         return
 
-    logger.info("WebSocket connected", extra={"user_id": user_id})
+    user_display_name = None
+    try:
+        async with AsyncSessionLocal() as db_session:
+            user = await get_user_profile(db_session, user_id)
+            if user:
+                if user.name and user.name.strip():
+                    user_display_name = user.name.strip()
+                elif user.email and user.email.strip():
+                    user_display_name = user.email.split("@")[0].strip()
+                logger.info(
+                    "User profile fetched",
+                    extra={"user_id": user_id, "user_name": user_display_name},
+                )
+    except Exception as e:
+        logger.warning("Could not fetch user profile", extra={"user_id": user_id, "error": str(e)})
+
+    if user_display_name:
+        personalized_system_prompt = (
+            f"{SYSTEM_PROMPT} "
+            f"The user's name is {user_display_name}. "
+            f"Address them by name naturally when appropriate."
+        )
+    else:
+        personalized_system_prompt = SYSTEM_PROMPT
+
+    logger.info("WebSocket connected", extra={"user_id": user_id, "user_name": user_display_name or "unknown"})
 
     conversation_history: list[dict] =[]
 
@@ -280,7 +305,7 @@ async def websocket_chat(
                 response = await openai_client.chat.completions.create(
                     model="gpt-4o-mini",
                     messages=[
-                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "system", "content": personalized_system_prompt},
                         *conversation_history,
                     ],
                     tools=TOOLS,
@@ -382,7 +407,7 @@ async def websocket_chat(
                     followup = await openai_client.chat.completions.create(
                         model="gpt-4o-mini",
                         messages=[
-                            {"role": "system", "content": SYSTEM_PROMPT},
+                            {"role": "system", "content": personalized_system_prompt},
                             *conversation_history,
                         ],
                         temperature=0.4,

@@ -1,6 +1,6 @@
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker, declarative_base
-from sqlalchemy import Column, Integer, String, Numeric, Boolean, ForeignKey, Text
+from sqlalchemy import Column, Integer, String, Numeric, Boolean, ForeignKey, Text, select
 
 import config
 
@@ -74,3 +74,15 @@ class ProductListing(Base):
 async def get_db():
     async with AsyncSessionLocal() as session:
         yield session
+
+
+class User(Base):
+    __tablename__ = "account_user"
+    id    = Column(Integer, primary_key=True)
+    name  = Column(String)
+    email = Column(String)
+
+
+async def get_user_profile(db: AsyncSession, user_id: int) -> User | None:
+    result = await db.execute(select(User).where(User.id == user_id))
+    return result.scalar_one_or_none()
