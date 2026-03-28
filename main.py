@@ -20,14 +20,12 @@ openai_client = AsyncOpenAI(
     timeout=config.OPENAI_TIMEOUT_SECONDS,
 )
 
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Chatbot service starting up", extra={"env": "production"})
     yield
     await redis_client.aclose()
     logger.info("Chatbot service shutting down")
-
 
 app = FastAPI(
     title="Dealnux Chatbot API",
@@ -45,12 +43,10 @@ app.add_middleware(
     allow_headers=["Authorization", "Content-Type"],
 )
 
-
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
     logger.error("Unhandled exception", extra={"path": request.url.path, "error": str(exc)})
     return JSONResponse(status_code=500, content={"detail": "Internal server error"})
-
 
 @app.get("/health")
 async def health_check(db: AsyncSession = Depends(get_db)):
@@ -60,7 +56,6 @@ async def health_check(db: AsyncSession = Depends(get_db)):
     except Exception as e:
         logger.error("Health check DB failure", extra={"error": str(e)})
         raise HTTPException(status_code=503, detail="Database unavailable")
-
 
 class ProductCard(BaseModel):
     id: int
@@ -75,23 +70,25 @@ class ProductCard(BaseModel):
     currency: Optional[str]
     free_shipping: Optional[bool]
 
-
 class ChatResponse(BaseModel):
     reply_text: str
     products: List[ProductCard] =[]
-
 
 def build_image_url(relative_path: str | None) -> str | None:
     if not relative_path:
         return None
     return config.DJANGO_MEDIA_URL.rstrip("/") + "/" + relative_path.lstrip("/")
 
-
 def trim_history(history: list[dict], max_turns: int) -> list[dict]:
     max_entries = max_turns * 2
-    if len(history) > max_entries:
-        return history[-max_entries:]
-    return history
+    if len(history) <= max_entries:
+        return history
+    
+    sliced = history[-max_entries:]
+    while sliced and sliced[0].get("role") != "user":
+        sliced.pop(0)
+        
+    return sliced
 
 async def search_products_in_db(
     db: AsyncSession,
@@ -142,7 +139,6 @@ async def search_products_in_db(
         ))
     return products
 
-
 TOOLS =[
     {
         "type": "function",
@@ -166,7 +162,7 @@ TOOLS =[
                     },
                     "condition": {
                         "type": "string",
-                        "enum":["NEW", "USED", "REFURBISHED", "OPEN_BOX"],
+                        "enum": ["NEW", "USED", "REFURBISHED", "OPEN_BOX"],
                         "description": "Product condition filter",
                     },
                     "free_shipping": {
@@ -188,7 +184,6 @@ SYSTEM_PROMPT = (
     "You can understand follow-up questions that refer to previous context in the conversation."
 )
 
-
 @app.websocket("/api/chat")
 async def websocket_chat(
     websocket: WebSocket,
@@ -196,17 +191,27 @@ async def websocket_chat(
 ):
     await websocket.accept()
 
-    # If token not in query params, fall back to first message
+    origin = websocket.headers.get("origin")
+    if origin and "*" not in config.CORS_ALLOWED_ORIGINS and origin not in config.CORS_ALLOWED_ORIGINS:
+        await websocket.close(code=1008, reason="Forbidden Origin")
+        return
+
     if not token:
         try:
             auth_raw = await asyncio.wait_for(websocket.receive_text(), timeout=15)
         except asyncio.TimeoutError:
             await websocket.close(code=1008, reason="Authentication timeout.")
             return
+        except WebSocketDisconnect:
+            return
+            
         try:
             auth_data = json.loads(auth_raw)
-            token = auth_data.get("token", "")
-        except (json.JSONDecodeError, AttributeError):
+            if isinstance(auth_data, dict):
+                token = auth_data.get("token", "")
+            else:
+                token = str(auth_raw).strip()
+        except json.JSONDecodeError:
             token = auth_raw.strip()
 
     try:
@@ -273,7 +278,10 @@ async def websocket_chat(
 
             try:
                 msg_data = json.loads(raw)
-                message = msg_data.get("message", raw)
+                if isinstance(msg_data, dict):
+                    message = msg_data.get("message", raw)
+                else:
+                    message = raw
             except json.JSONDecodeError:
                 message = raw
 
@@ -310,33 +318,31 @@ async def websocket_chat(
                     ],
                     tools=TOOLS,
                     tool_choice="auto",
+                    parallel_tool_calls=False,
                     temperature=0.4,
                 )
             except APITimeoutError:
                 logger.error("OpenAI timeout", extra={"user_id": user_id})
                 await websocket.send_text(
-                    ChatResponse(
-                        reply_text="The assistant is taking too long to respond. Please try again.",
-                        products=[],
-                    ).model_dump_json()
+                    ChatResponse(reply_text="The assistant is taking too long to respond. Please try again.", products=[]).model_dump_json()
                 )
                 continue
             except RateLimitError:
                 logger.error("OpenAI rate limit hit", extra={"user_id": user_id})
                 await websocket.send_text(
-                    ChatResponse(
-                        reply_text="The assistant is busy right now. Please try again in a moment.",
-                        products=[],
-                    ).model_dump_json()
+                    ChatResponse(reply_text="The assistant is busy right now. Please try again in a moment.", products=[]).model_dump_json()
                 )
                 continue
             except APIConnectionError:
                 logger.error("OpenAI connection error", extra={"user_id": user_id})
                 await websocket.send_text(
-                    ChatResponse(
-                        reply_text="Could not reach the assistant service. Please check your connection.",
-                        products=[],
-                    ).model_dump_json()
+                    ChatResponse(reply_text="Could not reach the assistant service. Please check your connection.", products=[]).model_dump_json()
+                )
+                continue
+            except Exception as e:
+                logger.error("OpenAI unexpected error", extra={"user_id": user_id, "error": str(e)})
+                await websocket.send_text(
+                    ChatResponse(reply_text="An unexpected error occurred. Please try asking in a different way.", products=[]).model_dump_json()
                 )
                 continue
 
@@ -350,11 +356,25 @@ async def websocket_chat(
                 except json.JSONDecodeError:
                     args = {}
 
-                keyword       = str(args.get("keyword", "")).strip()
-                max_price     = args.get("max_price")
-                min_price     = args.get("min_price")
-                condition     = args.get("condition")
-                free_shipping = args.get("free_shipping")
+                keyword = str(args.get("keyword", "")).strip()
+                
+                try:
+                    max_price = float(args.get("max_price")) if args.get("max_price") is not None else None
+                except (ValueError, TypeError):
+                    max_price = None
+
+                try:
+                    min_price = float(args.get("min_price")) if args.get("min_price") is not None else None
+                except (ValueError, TypeError):
+                    min_price = None
+
+                condition = args.get("condition")
+                
+                fs_raw = args.get("free_shipping")
+                if isinstance(fs_raw, str):
+                    free_shipping = fs_raw.lower() in ("true", "1", "yes")
+                else:
+                    free_shipping = bool(fs_raw) if fs_raw is not None else None
 
                 try:
                     async with AsyncSessionLocal() as db_session:
@@ -398,8 +418,7 @@ async def websocket_chat(
                 conversation_history.append({
                     "role": "tool",
                     "tool_call_id": tool_call.id,
-                    "content": json.dumps(
-                        [p.model_dump() for p in found_products], default=str
+                    "content": json.dumps([p.model_dump() for p in found_products], default=str
                     ),
                 })
 
@@ -424,7 +443,7 @@ async def websocket_chat(
                         )
 
             else:
-                reply_text     = response_message.content or ""
+                reply_text = response_message.content or ""
                 found_products =[]
 
             conversation_history.append({"role": "assistant", "content": reply_text})
