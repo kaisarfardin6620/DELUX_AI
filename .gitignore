@@ -5,3 +5,4 @@ __pycache__/
 .pytest_
 db.sqlite3
 media/
+server.log

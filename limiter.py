@@ -1,4 +1,5 @@
 import time
+import uuid
 from redis.asyncio import Redis
 import config
 
@@ -20,8 +21,8 @@ class ConnectionLimiter:
     async def release(self, user_id: int) -> None:
         key = f"ws_conn:{user_id}"
         count = await redis_client.decr(key)
-        if count < 0:
-            await redis_client.set(key, 0)
+        if count <= 0:
+            await redis_client.delete(key)
 
 class MessageRateLimiter:
     def __init__(self, max_messages: int = 30, window_seconds: int = 60):
@@ -31,6 +32,7 @@ class MessageRateLimiter:
     async def is_allowed(self, user_id: int) -> bool:
         key = f"ws_rate:{user_id}"
         now = time.time()
+        event_id = uuid.uuid4().hex
 
         pipeline = redis_client.pipeline()
         pipeline.zremrangebyscore(key, 0, now - self.window_seconds)
@@ -42,7 +44,7 @@ class MessageRateLimiter:
             return False
 
         pipeline = redis_client.pipeline()
-        pipeline.zadd(key, {str(now): now})
+        pipeline.zadd(key, {event_id: now})
         pipeline.expire(key, self.window_seconds)
         await pipeline.execute()
         return True
