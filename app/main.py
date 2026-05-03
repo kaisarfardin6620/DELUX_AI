@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core import config
 from app.media_api.router import router as media_router
 from app.chat.router import router as chat_router
+from app.store.router import router as store_router
 from app.core.database import get_db
 from app.core.limiter import redis_client
 from app.core.logger import logger
@@ -46,6 +47,7 @@ app.add_middleware(
 app.mount(config.FASTAPI_MEDIA_URL, StaticFiles(directory=str(MEDIA_ROOT)), name="media")
 app.include_router(chat_router)
 app.include_router(media_router)
+app.include_router(store_router)
 
 
 @app.exception_handler(Exception)

@@ -1,7 +1,8 @@
 import asyncio
 import json
 
-from fastapi import WebSocket, WebSocketDisconnect, WebSocketState
+from fastapi import WebSocket, WebSocketDisconnect
+from starlette.websockets import WebSocketState
 from openai import APIConnectionError, APITimeoutError, RateLimitError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -60,9 +61,10 @@ TOOLS = [
 SYSTEM_PROMPT = (
     "You are a helpful, friendly shopping assistant for Dealnux — an e-commerce platform. "
     "When a user asks about products, always use the search_products tool to find results from the database. "
-    "Never make up or guess product names, prices, or availability — only show what the tool returns. "
-    "Keep replies concise. If no products are found, suggest rephrasing or trying a broader keyword. "
-    "You can understand follow-up questions that refer to previous context in the conversation."
+    "Never make up or guess product names, prices, or availability. "
+    "Keep replies concise. "
+    "IMPORTANT: When you reply to the user (not making a tool call), you MUST return a valid JSON object with exactly two keys: "
+    "\"reply_text\" (your message string) and \"suggested_replies\" (a list of 2-3 short strings for quick reply buttons)."
 )
 
 
@@ -174,6 +176,28 @@ async def handle_chat_websocket(websocket: WebSocket, token: str | None) -> None
             conversation_history = json.loads(history_data)
         else:
             conversation_history = []
+            
+            welcome_msg = "Hi! I found some price drops on items similar to your recent searches."
+            try:
+                async with AsyncSessionLocal() as db_session:
+                    initial_products = await search_products_in_db(db_session, keyword="")
+            except Exception:
+                initial_products = []
+                
+            initial_response = ChatResponse(
+                reply_text=welcome_msg,
+                products=initial_products,
+                suggested_replies=["Show me running shoes under $100", "Compare Prices"]
+            )
+            conversation_history.append({
+                "role": "assistant", 
+                "content": json.dumps({
+                    "reply_text": welcome_msg, 
+                    "suggested_replies": initial_response.suggested_replies
+                })
+            })
+            await redis_client.set(history_key, json.dumps(conversation_history), ex=86400)
+            await websocket.send_text(initial_response.model_dump_json())
 
         while True:
             try:
@@ -187,6 +211,7 @@ async def handle_chat_websocket(websocket: WebSocket, token: str | None) -> None
                     ChatResponse(
                         reply_text="You're sending messages too quickly. Please slow down.",
                         products=[],
+                        suggested_replies=[]
                     ).model_dump_json()
                 )
                 continue
@@ -203,6 +228,7 @@ async def handle_chat_websocket(websocket: WebSocket, token: str | None) -> None
                             f"Please keep it under {config.WS_MAX_MESSAGE_LENGTH} characters."
                         ),
                         products=[],
+                        suggested_replies=[]
                     ).model_dump_json()
                 )
                 continue
@@ -231,6 +257,7 @@ async def handle_chat_websocket(websocket: WebSocket, token: str | None) -> None
                     ChatResponse(
                         reply_text="The assistant is taking too long to respond. Please try again.",
                         products=[],
+                        suggested_replies=[]
                     ).model_dump_json()
                 )
                 continue
@@ -240,6 +267,7 @@ async def handle_chat_websocket(websocket: WebSocket, token: str | None) -> None
                     ChatResponse(
                         reply_text="The assistant is busy right now. Please try again in a moment.",
                         products=[],
+                        suggested_replies=[]
                     ).model_dump_json()
                 )
                 continue
@@ -249,6 +277,7 @@ async def handle_chat_websocket(websocket: WebSocket, token: str | None) -> None
                     ChatResponse(
                         reply_text="Could not reach the assistant service. Please check your connection.",
                         products=[],
+                        suggested_replies=[]
                     ).model_dump_json()
                 )
                 continue
@@ -258,12 +287,14 @@ async def handle_chat_websocket(websocket: WebSocket, token: str | None) -> None
                     ChatResponse(
                         reply_text="An unexpected error occurred. Please try asking in a different way.",
                         products=[],
+                        suggested_replies=[]
                     ).model_dump_json()
                 )
                 continue
 
             response_message = response.choices[0].message
             reply_text = ""
+            suggested_replies = []
             found_products = []
 
             if response_message.tool_calls:
@@ -310,6 +341,7 @@ async def handle_chat_websocket(websocket: WebSocket, token: str | None) -> None
                                 ChatResponse(
                                     reply_text="There was a problem searching the database. Please try again.",
                                     products=[],
+                                    suggested_replies=[]
                                 ).model_dump_json()
                             )
                             continue
@@ -350,9 +382,22 @@ async def handle_chat_websocket(websocket: WebSocket, token: str | None) -> None
                                     {"role": "system", "content": personalized_system_prompt},
                                     *conversation_history,
                                 ],
+                                response_format={"type": "json_object"},
                                 temperature=0.4,
                             )
-                            reply_text = followup.choices[0].message.content or ""
+                            raw_content = followup.choices[0].message.content or "{}"
+                            data = json.loads(raw_content)
+                            reply_text = data.get("reply_text", "")
+                            suggested_replies = data.get("suggested_replies", [])
+                            
+                            conversation_history.append({
+                                "role": "assistant", 
+                                "content": json.dumps({
+                                    "reply_text": reply_text, 
+                                    "suggested_replies": suggested_replies
+                                })
+                            })
+                            
                         except Exception as exc:
                             logger.error("OpenAI follow-up error", extra={"user_id": user_id, "error": str(exc)})
                             if found_products:
@@ -362,18 +407,35 @@ async def handle_chat_websocket(websocket: WebSocket, token: str | None) -> None
                                     f"Sorry, I couldn't find any '{keyword}' matching your criteria. "
                                     "Try a broader keyword or adjust your filters."
                                 )
+                            suggested_replies = ["Try a different keyword", "Compare Prices"]
+                            conversation_history.append({"role": "assistant", "content": json.dumps({"reply_text": reply_text, "suggested_replies": suggested_replies})})
                         break 
                     else:
                         reply_text = "I encountered an unexpected issue. Please try again."
+                        conversation_history.append({"role": "assistant", "content": json.dumps({"reply_text": reply_text, "suggested_replies": []})})
             else:
-                reply_text = response_message.content or ""
+                try:
+                    raw_content = response_message.content or "{}"
+                    data = json.loads(raw_content)
+                    reply_text = data.get("reply_text", "")
+                    suggested_replies = data.get("suggested_replies", [])
+                    conversation_history.append({
+                        "role": "assistant", 
+                        "content": json.dumps({
+                            "reply_text": reply_text, 
+                            "suggested_replies": suggested_replies
+                        })
+                    })
+                except Exception:
+                    reply_text = response_message.content or ""
+                    suggested_replies = []
+                    conversation_history.append({"role": "assistant", "content": json.dumps({"reply_text": reply_text, "suggested_replies": []})})
                 found_products = []
 
-            conversation_history.append({"role": "assistant", "content": reply_text})
             await redis_client.set(history_key, json.dumps(conversation_history), ex=86400)
 
             await websocket.send_text(
-                ChatResponse(reply_text=reply_text, products=found_products).model_dump_json()
+                ChatResponse(reply_text=reply_text, products=found_products, suggested_replies=suggested_replies).model_dump_json()
             )
             
     except WebSocketDisconnect:

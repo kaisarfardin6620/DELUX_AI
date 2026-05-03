@@ -1,7 +1,9 @@
 import os
+from pathlib import Path
 from dotenv import load_dotenv
 
-load_dotenv(override=True)
+_ROOT = Path(__file__).resolve().parent.parent.parent
+load_dotenv(_ROOT / ".env", override=True)
 
 def _require(key: str) -> str:
     val = os.getenv(key)
