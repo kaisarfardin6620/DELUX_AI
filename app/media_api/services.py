@@ -4,7 +4,7 @@ from pathlib import Path
 
 from fastapi import HTTPException, UploadFile, status
 
-import config
+from app.core import config
 
 MEDIA_ROOT = Path(__file__).resolve().parent.parent / "media"
 MEDIA_ROOT.mkdir(parents=True, exist_ok=True)
@@ -100,7 +100,7 @@ async def save_uploaded_image(upload: UploadFile, folder: str = "products") -> d
 
     return {
         "filename": destination_path.name,
-        "relative_path": str(relative_path).replace("\\", "/"),
-        "url": build_image_url(str(relative_path).replace("\\", "/")),
+        "relative_path": str(relative_path).replace("\", "/"),
+        "url": build_image_url(str(relative_path).replace("\", "/")),
         "size_bytes": total_bytes,
     }

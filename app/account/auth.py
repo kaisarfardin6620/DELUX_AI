@@ -1,7 +1,5 @@
 import jwt
-
-import config
-
+from app.core import config
 
 def verify_token(token: str) -> int:
     try:

@@ -1,4 +1,4 @@
-﻿from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -7,18 +7,21 @@ from fastapi.staticfiles import StaticFiles
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-import config
-from api.media import router as media_router
-from api.chat import router as chat_router
-from database import get_db
-from limiter import redis_client
-from logger import logger
-from services.media import MEDIA_ROOT
+from app.core import config
+from app.media_api.router import router as media_router
+from app.chat.router import router as chat_router
+from app.core.database import get_db
+from app.core.limiter import redis_client
+from app.core.logger import logger
+from app.media_api.services import MEDIA_ROOT
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Chatbot service starting up", extra={"env": "production"})
+    keys = await redis_client.keys("ws_conn:*")
+    if keys:
+        await redis_client.delete(*keys)
     yield
     await redis_client.aclose()
     logger.info("Chatbot service shutting down")

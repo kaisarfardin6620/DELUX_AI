@@ -1,7 +1,5 @@
-from typing import List, Optional
-
-from pydantic import BaseModel, Field
-
+from typing import Optional
+from pydantic import BaseModel
 
 class ProductCard(BaseModel):
     id: int
@@ -15,8 +13,3 @@ class ProductCard(BaseModel):
     condition: Optional[str]
     currency: Optional[str]
     free_shipping: Optional[bool]
-
-
-class ChatResponse(BaseModel):
-    reply_text: str
-    products: List[ProductCard] = Field(default_factory=list)

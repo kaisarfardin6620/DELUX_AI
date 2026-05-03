@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-exec gunicorn main:app \
+exec gunicorn app.main:app \
   -k uvicorn.workers.UvicornWorker \
   --workers "${WEB_CONCURRENCY:-2}" \
   --bind 0.0.0.0:8001 \

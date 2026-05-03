@@ -1,7 +1,7 @@
 import time
 import uuid
 from redis.asyncio import Redis
-import config
+from app.core import config
 
 redis_client = Redis.from_url(config.REDIS_URL, decode_responses=True)
 

@@ -1,18 +1,19 @@
 import asyncio
 import json
 
-from fastapi import WebSocket, WebSocketDisconnect
+from fastapi import WebSocket, WebSocketDisconnect, WebSocketState
 from openai import APIConnectionError, APITimeoutError, RateLimitError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-import config
-from auth import verify_token
-from database import AsyncSessionLocal, get_user_profile
-from limiter import connection_limiter, message_rate_limiter
-from logger import logger
+from app.core import config
+from app.account.auth import verify_token
+from app.core.database import AsyncSessionLocal
+from app.account.models import get_user_profile
+from app.core.limiter import connection_limiter, message_rate_limiter, redis_client
+from app.core.logger import logger
 from openai import AsyncOpenAI
-from schemas import ChatResponse
-from services.products import search_products_in_db
+from app.chat.schemas import ChatResponse
+from app.store.services import search_products_in_db
 
 openai_client = AsyncOpenAI(
     api_key=config.OPENAI_API_KEY,
@@ -117,60 +118,63 @@ async def _get_personalized_prompt(user_id: int) -> tuple[str, str | None]:
 
 
 async def handle_chat_websocket(websocket: WebSocket, token: str | None) -> None:
-    origin = websocket.headers.get("origin")
-    if origin and "*" not in config.CORS_ALLOWED_ORIGINS and origin not in config.CORS_ALLOWED_ORIGINS:
-        await websocket.close(code=1008, reason="Forbidden Origin")
-        return
-
-    await websocket.accept()
-
-    if not token:
-        try:
-            auth_raw = await asyncio.wait_for(websocket.receive_text(), timeout=15)
-        except asyncio.TimeoutError:
-            await websocket.close(code=1008, reason="Authentication timeout.")
-            return
-        except WebSocketDisconnect:
-            return
-
-        try:
-            auth_data = json.loads(auth_raw)
-            if isinstance(auth_data, dict):
-                token = auth_data.get("token", "")
-            else:
-                token = str(auth_raw).strip()
-        except json.JSONDecodeError:
-            token = auth_raw.strip()
-
-    user_id: int | None = None
-    connection_acquired = False
-
     try:
-        user_id = verify_token(token)
-    except ValueError as exc:
-        await websocket.close(code=1008, reason=str(exc))
-        logger.warning("WebSocket auth failed", extra={"reason": str(exc)})
-        return
+        origin = websocket.headers.get("origin")
+        if origin and "*" not in config.CORS_ALLOWED_ORIGINS and origin not in config.CORS_ALLOWED_ORIGINS:
+            await websocket.close(code=1008, reason="Forbidden Origin")
+            return
 
-    allowed = await connection_limiter.acquire(user_id)
-    if not allowed:
-        await websocket.close(
-            code=1008,
-            reason="Too many active connections. Please close other chat sessions.",
+        await websocket.accept()
+
+        if not token:
+            try:
+                auth_raw = await asyncio.wait_for(websocket.receive_text(), timeout=15)
+            except asyncio.TimeoutError:
+                await websocket.close(code=1008, reason="Authentication timeout.")
+                return
+
+            try:
+                auth_data = json.loads(auth_raw)
+                if isinstance(auth_data, dict):
+                    token = auth_data.get("token", "")
+                else:
+                    token = str(auth_raw).strip()
+            except json.JSONDecodeError:
+                token = auth_raw.strip()
+
+        user_id: int | None = None
+        connection_acquired = False
+
+        try:
+            user_id = verify_token(token)
+        except ValueError as exc:
+            await websocket.close(code=1008, reason=str(exc))
+            logger.warning("WebSocket auth failed", extra={"reason": str(exc)})
+            return
+
+        allowed = await connection_limiter.acquire(user_id)
+        if not allowed:
+            await websocket.close(
+                code=1008,
+                reason="Too many active connections. Please close other chat sessions.",
+            )
+            logger.warning("Connection limit exceeded", extra={"user_id": user_id})
+            return
+        connection_acquired = True
+
+        personalized_system_prompt, user_display_name = await _get_personalized_prompt(user_id)
+        logger.info(
+            "WebSocket connected",
+            extra={"user_id": user_id, "user_name": user_display_name or "unknown"},
         )
-        logger.warning("Connection limit exceeded", extra={"user_id": user_id})
-        return
-    connection_acquired = True
 
-    personalized_system_prompt, user_display_name = await _get_personalized_prompt(user_id)
-    logger.info(
-        "WebSocket connected",
-        extra={"user_id": user_id, "user_name": user_display_name or "unknown"},
-    )
+        history_key = f"chat_hist:{user_id}"
+        history_data = await redis_client.get(history_key)
+        if history_data:
+            conversation_history = json.loads(history_data)
+        else:
+            conversation_history = []
 
-    conversation_history: list[dict] = []
-
-    try:
         while True:
             try:
                 raw = await asyncio.wait_for(websocket.receive_text(), timeout=300)
@@ -207,6 +211,7 @@ async def handle_chat_websocket(websocket: WebSocket, token: str | None) -> None
 
             conversation_history.append({"role": "user", "content": message})
             conversation_history = trim_history(conversation_history, config.WS_MAX_HISTORY_TURNS)
+            await redis_client.set(history_key, json.dumps(conversation_history), ex=86400)
 
             try:
                 response = await openai_client.chat.completions.create(
@@ -258,116 +263,125 @@ async def handle_chat_websocket(websocket: WebSocket, token: str | None) -> None
                 continue
 
             response_message = response.choices[0].message
+            reply_text = ""
+            found_products = []
 
             if response_message.tool_calls:
-                tool_call = response_message.tool_calls[0]
+                for tool_call in response_message.tool_calls:
+                    if tool_call.function.name == "search_products":
+                        try:
+                            args = json.loads(tool_call.function.arguments)
+                        except json.JSONDecodeError:
+                            args = {}
 
-                try:
-                    args = json.loads(tool_call.function.arguments)
-                except json.JSONDecodeError:
-                    args = {}
+                        keyword = str(args.get("keyword", "")).strip()
 
-                keyword = str(args.get("keyword", "")).strip()
+                        try:
+                            max_price = float(args.get("max_price")) if args.get("max_price") is not None else None
+                        except (ValueError, TypeError):
+                            max_price = None
 
-                try:
-                    max_price = float(args.get("max_price")) if args.get("max_price") is not None else None
-                except (ValueError, TypeError):
-                    max_price = None
+                        try:
+                            min_price = float(args.get("min_price")) if args.get("min_price") is not None else None
+                        except (ValueError, TypeError):
+                            min_price = None
 
-                try:
-                    min_price = float(args.get("min_price")) if args.get("min_price") is not None else None
-                except (ValueError, TypeError):
-                    min_price = None
+                        condition = args.get("condition")
 
-                condition = args.get("condition")
+                        fs_raw = args.get("free_shipping")
+                        if isinstance(fs_raw, str):
+                            free_shipping = fs_raw.lower() in ("true", "1", "yes")
+                        else:
+                            free_shipping = bool(fs_raw) if fs_raw is not None else None
 
-                fs_raw = args.get("free_shipping")
-                if isinstance(fs_raw, str):
-                    free_shipping = fs_raw.lower() in ("true", "1", "yes")
-                else:
-                    free_shipping = bool(fs_raw) if fs_raw is not None else None
+                        try:
+                            async with AsyncSessionLocal() as db_session:
+                                found_products = await search_products_in_db(
+                                    db_session,
+                                    keyword=keyword,
+                                    max_price=max_price,
+                                    min_price=min_price,
+                                    condition=condition,
+                                    free_shipping=free_shipping,
+                                )
+                        except Exception as exc:
+                            logger.error("DB search error", extra={"user_id": user_id, "error": str(exc)})
+                            await websocket.send_text(
+                                ChatResponse(
+                                    reply_text="There was a problem searching the database. Please try again.",
+                                    products=[],
+                                ).model_dump_json()
+                            )
+                            continue
 
-                try:
-                    async with AsyncSessionLocal() as db_session:
-                        found_products = await search_products_in_db(
-                            db_session,
-                            keyword=keyword,
-                            max_price=max_price,
-                            min_price=min_price,
-                            condition=condition,
-                            free_shipping=free_shipping,
+                        logger.info(
+                            "Product search completed",
+                            extra={"user_id": user_id, "keyword": keyword, "results": len(found_products)},
                         )
-                except Exception as exc:
-                    logger.error("DB search error", extra={"user_id": user_id, "error": str(exc)})
-                    await websocket.send_text(
-                        ChatResponse(
-                            reply_text="There was a problem searching the database. Please try again.",
-                            products=[],
-                        ).model_dump_json()
-                    )
-                    continue
 
-                logger.info(
-                    "Product search completed",
-                    extra={"user_id": user_id, "keyword": keyword, "results": len(found_products)},
-                )
-
-                conversation_history.append(
-                    {
-                        "role": "assistant",
-                        "content": None,
-                        "tool_calls": [
+                        conversation_history.append(
                             {
-                                "id": tool_call.id,
-                                "type": "function",
-                                "function": {
-                                    "name": tool_call.function.name,
-                                    "arguments": tool_call.function.arguments,
-                                },
+                                "role": "assistant",
+                                "content": None,
+                                "tool_calls": [
+                                    {
+                                        "id": tool_call.id,
+                                        "type": "function",
+                                        "function": {
+                                            "name": tool_call.function.name,
+                                            "arguments": tool_call.function.arguments,
+                                        },
+                                    }
+                                ],
                             }
-                        ],
-                    }
-                )
-                conversation_history.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": tool_call.id,
-                        "content": json.dumps([p.model_dump() for p in found_products], default=str),
-                    }
-                )
-
-                try:
-                    followup = await openai_client.chat.completions.create(
-                        model="gpt-4o-mini",
-                        messages=[
-                            {"role": "system", "content": personalized_system_prompt},
-                            *conversation_history,
-                        ],
-                        temperature=0.4,
-                    )
-                    reply_text = followup.choices[0].message.content or ""
-                except Exception as exc:
-                    logger.error("OpenAI follow-up error", extra={"user_id": user_id, "error": str(exc)})
-                    if found_products:
-                        reply_text = f"Here are some {keyword} options I found for you:"
-                    else:
-                        reply_text = (
-                            f"Sorry, I couldn't find any '{keyword}' matching your criteria. "
-                            "Try a broader keyword or adjust your filters."
                         )
+                        conversation_history.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": tool_call.id,
+                                "content": json.dumps([p.model_dump() for p in found_products], default=str),
+                            }
+                        )
+
+                        try:
+                            followup = await openai_client.chat.completions.create(
+                                model="gpt-4o-mini",
+                                messages=[
+                                    {"role": "system", "content": personalized_system_prompt},
+                                    *conversation_history,
+                                ],
+                                temperature=0.4,
+                            )
+                            reply_text = followup.choices[0].message.content or ""
+                        except Exception as exc:
+                            logger.error("OpenAI follow-up error", extra={"user_id": user_id, "error": str(exc)})
+                            if found_products:
+                                reply_text = f"Here are some {keyword} options I found for you:"
+                            else:
+                                reply_text = (
+                                    f"Sorry, I couldn't find any '{keyword}' matching your criteria. "
+                                    "Try a broader keyword or adjust your filters."
+                                )
+                        break 
+                    else:
+                        reply_text = "I encountered an unexpected issue. Please try again."
             else:
                 reply_text = response_message.content or ""
                 found_products = []
 
             conversation_history.append({"role": "assistant", "content": reply_text})
+            await redis_client.set(history_key, json.dumps(conversation_history), ex=86400)
 
             await websocket.send_text(
                 ChatResponse(reply_text=reply_text, products=found_products).model_dump_json()
             )
+            
     except WebSocketDisconnect:
-        logger.info("WebSocket disconnected cleanly", extra={"user_id": user_id})
+        logger.info("WebSocket disconnected cleanly", extra={"user_id": user_id if 'user_id' in locals() else None})
     except Exception as exc:
-        logger.error("Unexpected WebSocket error", extra={"user_id": user_id, "error": str(exc)})
+        logger.error("Fatal websocket error", extra={"error": str(exc)}, exc_info=True)
+        if websocket.client_state != WebSocketState.DISCONNECTED:
+            await websocket.close(code=1011)
     finally:
-        if connection_acquired and user_id is not None:
+        if 'connection_acquired' in locals() and connection_acquired and 'user_id' in locals() and user_id is not None:
             await connection_limiter.release(user_id)

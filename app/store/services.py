@@ -1,12 +1,9 @@
 from typing import List
-
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-
-from database import Platform, Product, ProductListing
-from schemas import ProductCard
-from services.media import build_image_url
-
+from app.store.models import Platform, Product, ProductListing
+from app.store.schemas import ProductCard
+from app.media_api.services import build_image_url
 
 async def search_products_in_db(
     db: AsyncSession,

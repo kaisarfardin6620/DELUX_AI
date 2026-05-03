@@ -1,8 +1,8 @@
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
-from auth import verify_token
-from services.media import save_uploaded_image
+from app.account.auth import verify_token
+from app.media_api.services import save_uploaded_image
 
 router = APIRouter(prefix="/api/media", tags=["media"])
 security = HTTPBearer(auto_error=False)
