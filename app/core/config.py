@@ -53,3 +53,5 @@ DB_MAX_OVERFLOW  = int(_optional("DB_MAX_OVERFLOW", "20"))
 DB_POOL_TIMEOUT  = int(_optional("DB_POOL_TIMEOUT", "30"))
 
 OPENAI_TIMEOUT_SECONDS = int(_optional("OPENAI_TIMEOUT_SECONDS", "30"))
+OPENAI_MODEL_CHAT = _optional("OPENAI_MODEL_CHAT", "gpt-4o-mini")
+OPENAI_MODEL_VISION = _optional("OPENAI_MODEL_VISION", "gpt-4o")

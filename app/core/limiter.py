@@ -32,22 +32,31 @@ class MessageRateLimiter:
     async def is_allowed(self, user_id: int) -> bool:
         key = f"ws_rate:{user_id}"
         now = time.time()
+        window_start = now - self.window_seconds
         event_id = uuid.uuid4().hex
 
-        pipeline = redis_client.pipeline()
-        pipeline.zremrangebyscore(key, 0, now - self.window_seconds)
-        pipeline.zcard(key)
-        results = await pipeline.execute()
-        current_message_count = results[1]
+        lua_script = """
+        local key = KEYS[1]
+        local now = tonumber(ARGV[1])
+        local window_start = tonumber(ARGV[2])
+        local max_messages = tonumber(ARGV[3])
+        local event_id = ARGV[4]
+        local window_seconds = tonumber(ARGV[5])
 
-        if current_message_count >= self.max_messages:
-            return False
+        redis.call('ZREMRANGEBYSCORE', key, 0, window_start)
+        local count = redis.call('ZCARD', key)
 
-        pipeline = redis_client.pipeline()
-        pipeline.zadd(key, {event_id: now})
-        pipeline.expire(key, self.window_seconds)
-        await pipeline.execute()
-        return True
+        if count < max_messages then
+            redis.call('ZADD', key, now, event_id)
+            redis.call('EXPIRE', key, window_seconds)
+            return 1
+        else
+            return 0
+        end
+        """
+        
+        result = await redis_client.eval(lua_script, 1, key, now, window_start, self.max_messages, event_id, self.window_seconds)
+        return bool(result)
 
 connection_limiter = ConnectionLimiter()
 message_rate_limiter = MessageRateLimiter(

@@ -55,6 +55,11 @@ def trim_history(history: list[dict], max_turns: int) -> list[dict]:
         trimmed = []
         for msg in reversed(history):
             content = msg.get("content") or ""
+            
+            if len(content) > 15000:
+                content = content[:15000] + "... [truncated]"
+                msg["content"] = content
+
             if msg.get("tool_calls"):
                 content += json.dumps(msg.get("tool_calls"))
             
@@ -104,9 +109,9 @@ async def _get_personalized_prompt(user_id: int) -> tuple[str, str | None]:
                     extra={"user_id": user_id, "user_name": user_display_name},
                 )
     except Exception as exc:
-        logger.warning(
+        logger.error(
             "Could not fetch user profile",
-            extra={"user_id": user_id, "error": str(exc)},
+            extra={"user_id": user_id, "error_type": type(exc).__name__, "error": str(exc)},
         )
 
     if user_display_name:
@@ -180,7 +185,8 @@ async def handle_chat_websocket(websocket: WebSocket, token: str | None) -> None
             try:
                 async with AsyncSessionLocal() as db_session:
                     initial_products = await get_featured_products(db_session, limit=5)
-            except Exception:
+            except Exception as exc:
+                logger.error("Failed to fetch initial products", extra={"user_id": user_id, "error": str(exc)})
                 initial_products = []
                 
             initial_response = ChatResponse(
@@ -245,7 +251,7 @@ async def handle_chat_websocket(websocket: WebSocket, token: str | None) -> None
                     openai_messages.append(clean_msg)
 
                 response = await openai_client.chat.completions.create(
-                    model="gpt-4o-mini",
+                    model=config.OPENAI_MODEL_CHAT,
                     messages=[
                         {"role": "system", "content": personalized_system_prompt},
                         *openai_messages,
@@ -318,7 +324,8 @@ async def handle_chat_websocket(websocket: WebSocket, token: str | None) -> None
                         if tool_name in ["search_products", "get_featured_products"]:
                             try:
                                 found_products = json.loads(tool_output)
-                            except:
+                            except json.JSONDecodeError as e:
+                                logger.error("Failed to parse tool output as JSON", extra={"user_id": user_id, "error": str(e), "output": tool_output[:100]})
                                 found_products = []
 
                     except Exception as exc:
@@ -357,7 +364,7 @@ async def handle_chat_websocket(websocket: WebSocket, token: str | None) -> None
                             openai_messages.append(clean_msg)
 
                         followup = await openai_client.chat.completions.create(
-                            model="gpt-4o-mini",
+                            model=config.OPENAI_MODEL_CHAT,
                             messages=[
                                 {"role": "system", "content": personalized_system_prompt},
                                 *openai_messages,
@@ -387,15 +394,21 @@ async def handle_chat_websocket(websocket: WebSocket, token: str | None) -> None
             else:
                 try:
                     raw_content = response_message.content or "{}"
-                    data = json.loads(raw_content)
-                    reply_text = data.get("reply_text", "")
-                    suggested_replies = data.get("suggested_replies", [])
+                    if raw_content.strip().startswith("{"):
+                        data = json.loads(raw_content)
+                        reply_text = data.get("reply_text", "")
+                        suggested_replies = data.get("suggested_replies", [])
+                    else:
+                        reply_text = raw_content
+                        suggested_replies = []
+
                     conversation_history.append({
                         "role": "assistant", 
                         "content": reply_text, 
                         "metadata": {"suggested_replies": suggested_replies}
                     })
-                except Exception:
+                except Exception as exc:
+                    logger.warning("Failed to parse assistant JSON", extra={"user_id": user_id, "error": str(exc)})
                     reply_text = response_message.content or ""
                     suggested_replies = []
                     conversation_history.append({

@@ -79,7 +79,12 @@ async def save_uploaded_image(upload: UploadFile, folder: str = "products") -> d
     try:
         with destination_path.open("wb") as output_file:
             while True:
-                chunk = await upload.read(1024 * 1024)
+                try:
+                    chunk = await asyncio.wait_for(upload.read(1024 * 1024), timeout=10.0)
+                except asyncio.TimeoutError:
+                    logger.error("Upload read timeout", extra={"filename": upload.filename})
+                    raise HTTPException(status_code=408, detail="Upload timed out.")
+                
                 if not chunk:
                     break
 

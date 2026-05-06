@@ -51,12 +51,16 @@ async def compare_product_prices(product_id: int, db: AsyncSession = Depends(get
 
 @router.post("/visual-search", response_model=List[ProductCard])
 async def visual_search(file: UploadFile = File(...), db: AsyncSession = Depends(get_db)):
+    allowed_types = {"image/jpeg", "image/png", "image/webp"}
+    if file.content_type not in allowed_types:
+        raise HTTPException(status_code=400, detail="Invalid image type. Only JPEG, PNG, and WebP are supported.")
+
     contents = await file.read()
     base64_image = base64.b64encode(contents).decode("utf-8")
 
     try:
         response = await openai_client.chat.completions.create(
-            model="gpt-4o",
+            model=config.OPENAI_MODEL_VISION,
             messages=[
                 {
                     "role": "user",
@@ -73,10 +77,18 @@ async def visual_search(file: UploadFile = File(...), db: AsyncSession = Depends
                 }
             ],
             max_tokens=50,
+            timeout=config.OPENAI_TIMEOUT_SECONDS,
         )
         search_keyword = response.choices[0].message.content.strip()
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"AI Vision error: {str(e)}")
 
+    if not search_keyword or "sorry" in search_keyword.lower() or "not identify" in search_keyword.lower():
+        raise HTTPException(status_code=404, detail="I couldn't identify a clear product in this image. Please try a different photo.")
+
     found_products = await search_products_in_db(db, keyword=search_keyword)
+    
+    if not found_products:
+         raise HTTPException(status_code=404, detail=f"I identified this as '{search_keyword}', but couldn't find any matching products in our database.")
+
     return found_products
