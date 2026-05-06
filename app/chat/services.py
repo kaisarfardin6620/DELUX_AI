@@ -1,11 +1,10 @@
 import asyncio
 import json
-
+import tiktoken
 from fastapi import WebSocket, WebSocketDisconnect
 from starlette.websockets import WebSocketState
 from openai import APIConnectionError, APITimeoutError, RateLimitError
 from sqlalchemy.ext.asyncio import AsyncSession
-
 from app.core import config
 from app.account.auth import verify_token
 from app.core.database import AsyncSessionLocal
@@ -14,49 +13,27 @@ from app.core.limiter import connection_limiter, message_rate_limiter, redis_cli
 from app.core.logger import logger
 from openai import AsyncOpenAI
 from app.chat.schemas import ChatResponse
-from app.store.services import search_products_in_db
+from app.store.services import search_products_in_db, get_featured_products
+from app.core.mcp import mcp_server
 
 openai_client = AsyncOpenAI(
     api_key=config.OPENAI_API_KEY,
     timeout=config.OPENAI_TIMEOUT_SECONDS,
 )
 
-TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "search_products",
-            "description": "Search the Dealnux product database based on user requirements.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "keyword": {
-                        "type": "string",
-                        "description": "Product name or type (e.g. 'smartphone', 'running shoes')",
-                    },
-                    "max_price": {
-                        "type": "number",
-                        "description": "Maximum price the user wants to pay",
-                    },
-                    "min_price": {
-                        "type": "number",
-                        "description": "Minimum price filter",
-                    },
-                    "condition": {
-                        "type": "string",
-                        "enum": ["NEW", "USED", "REFURBISHED", "OPEN_BOX"],
-                        "description": "Product condition filter",
-                    },
-                    "free_shipping": {
-                        "type": "boolean",
-                        "description": "Set to true if user wants only free-shipping products",
-                    },
-                },
-                "required": ["keyword"],
-            },
-        },
-    }
-]
+async def get_openai_tools():
+    mcp_tools = await mcp_server.list_tools()
+    openai_tools = []
+    for tool in mcp_tools:
+        openai_tools.append({
+            "type": "function",
+            "function": {
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": tool.inputSchema,
+            }
+        })
+    return openai_tools
 
 SYSTEM_PROMPT = (
     "You are a helpful, friendly shopping assistant for Dealnux — an e-commerce platform. "
@@ -69,15 +46,37 @@ SYSTEM_PROMPT = (
 
 
 def trim_history(history: list[dict], max_turns: int) -> list[dict]:
-    max_entries = max_turns * 2
-    if len(history) <= max_entries:
-        return history
+    try:
+        encoding = tiktoken.encoding_for_model("gpt-4o-mini")
 
-    sliced = history[-max_entries:]
-    while sliced and sliced[0].get("role") != "user":
-        sliced.pop(0)
-
-    return sliced
+        max_tokens = 8000 
+        
+        current_tokens = 0
+        trimmed = []
+        for msg in reversed(history):
+            content = msg.get("content") or ""
+            if msg.get("tool_calls"):
+                content += json.dumps(msg.get("tool_calls"))
+            
+            tokens = len(encoding.encode(content)) + 4
+            if current_tokens + tokens > max_tokens:
+                break
+            trimmed.insert(0, msg)
+            current_tokens += tokens
+            
+        while trimmed and trimmed[0].get("role") != "user":
+            trimmed.pop(0)
+            
+        return trimmed
+    except Exception as exc:
+        logger.warning("Tiktoken trimming failed, falling back to turn trimming", extra={"error": str(exc)})
+        max_entries = max_turns * 2
+        if len(history) <= max_entries:
+            return history
+        sliced = history[-max_entries:]
+        while sliced and sliced[0].get("role") != "user":
+            sliced.pop(0)
+        return sliced
 
 
 def _parse_incoming_message(raw: str) -> str:
@@ -130,7 +129,7 @@ async def handle_chat_websocket(websocket: WebSocket, token: str | None) -> None
 
         if not token:
             try:
-                auth_raw = await asyncio.wait_for(websocket.receive_text(), timeout=15)
+                auth_raw = await asyncio.wait_for(websocket.receive_text(), timeout=30)
             except asyncio.TimeoutError:
                 await websocket.close(code=1008, reason="Authentication timeout.")
                 return
@@ -180,7 +179,7 @@ async def handle_chat_websocket(websocket: WebSocket, token: str | None) -> None
             welcome_msg = "Hi! I found some price drops on items similar to your recent searches."
             try:
                 async with AsyncSessionLocal() as db_session:
-                    initial_products = await search_products_in_db(db_session, keyword="")
+                    initial_products = await get_featured_products(db_session, limit=5)
             except Exception:
                 initial_products = []
                 
@@ -191,10 +190,10 @@ async def handle_chat_websocket(websocket: WebSocket, token: str | None) -> None
             )
             conversation_history.append({
                 "role": "assistant", 
-                "content": json.dumps({
-                    "reply_text": welcome_msg, 
+                "content": welcome_msg,
+                "metadata": {
                     "suggested_replies": initial_response.suggested_replies
-                })
+                }
             })
             await redis_client.set(history_key, json.dumps(conversation_history), ex=86400)
             await websocket.send_text(initial_response.model_dump_json())
@@ -240,13 +239,18 @@ async def handle_chat_websocket(websocket: WebSocket, token: str | None) -> None
             await redis_client.set(history_key, json.dumps(conversation_history), ex=86400)
 
             try:
+                openai_messages = []
+                for msg in conversation_history:
+                    clean_msg = {k: v for k, v in msg.items() if k != "metadata"}
+                    openai_messages.append(clean_msg)
+
                 response = await openai_client.chat.completions.create(
                     model="gpt-4o-mini",
                     messages=[
                         {"role": "system", "content": personalized_system_prompt},
-                        *conversation_history,
+                        *openai_messages,
                     ],
-                    tools=TOOLS,
+                    tools=await get_openai_tools(),
                     tool_choice="auto",
                     parallel_tool_calls=False,
                     temperature=0.4,
@@ -299,120 +303,87 @@ async def handle_chat_websocket(websocket: WebSocket, token: str | None) -> None
 
             if response_message.tool_calls:
                 for tool_call in response_message.tool_calls:
-                    if tool_call.function.name == "search_products":
-                        try:
-                            args = json.loads(tool_call.function.arguments)
-                        except json.JSONDecodeError:
-                            args = {}
+                    tool_name = tool_call.function.name
+                    try:
+                        args = json.loads(tool_call.function.arguments)
+                    except json.JSONDecodeError:
+                        args = {}
 
-                        keyword = str(args.get("keyword", "")).strip()
+                    logger.info("Tool call initiated", extra={"user_id": user_id, "tool": tool_name})
 
-                        try:
-                            max_price = float(args.get("max_price")) if args.get("max_price") is not None else None
-                        except (ValueError, TypeError):
-                            max_price = None
+                    try:
+                        tool_results = await mcp_server.call_tool(tool_name, args)
+                        tool_output = "\n".join([r.text for r in tool_results if hasattr(r, 'text')])
+                        
+                        if tool_name in ["search_products", "get_featured_products"]:
+                            try:
+                                found_products = json.loads(tool_output)
+                            except:
+                                found_products = []
 
-                        try:
-                            min_price = float(args.get("min_price")) if args.get("min_price") is not None else None
-                        except (ValueError, TypeError):
-                            min_price = None
+                    except Exception as exc:
+                        logger.error("Tool execution error", extra={"user_id": user_id, "tool": tool_name, "error": str(exc)})
+                        tool_output = f"Error: {str(exc)}"
+                        found_products = []
 
-                        condition = args.get("condition")
+                    conversation_history.append(
+                        {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": tool_call.id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": tool_name,
+                                        "arguments": tool_call.function.arguments,
+                                    },
+                                }
+                            ],
+                        }
+                    )
+                    conversation_history.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tool_call.id,
+                            "content": tool_output,
+                        }
+                    )
 
-                        fs_raw = args.get("free_shipping")
-                        if isinstance(fs_raw, str):
-                            free_shipping = fs_raw.lower() in ("true", "1", "yes")
-                        else:
-                            free_shipping = bool(fs_raw) if fs_raw is not None else None
+                    try:
+                        openai_messages = []
+                        for msg in conversation_history:
+                            clean_msg = {k: v for k, v in msg.items() if k != "metadata"}
+                            openai_messages.append(clean_msg)
 
-                        try:
-                            async with AsyncSessionLocal() as db_session:
-                                found_products = await search_products_in_db(
-                                    db_session,
-                                    keyword=keyword,
-                                    max_price=max_price,
-                                    min_price=min_price,
-                                    condition=condition,
-                                    free_shipping=free_shipping,
-                                )
-                        except Exception as exc:
-                            logger.error("DB search error", extra={"user_id": user_id, "error": str(exc)})
-                            await websocket.send_text(
-                                ChatResponse(
-                                    reply_text="There was a problem searching the database. Please try again.",
-                                    products=[],
-                                    suggested_replies=[]
-                                ).model_dump_json()
-                            )
-                            continue
-
-                        logger.info(
-                            "Product search completed",
-                            extra={"user_id": user_id, "keyword": keyword, "results": len(found_products)},
+                        followup = await openai_client.chat.completions.create(
+                            model="gpt-4o-mini",
+                            messages=[
+                                {"role": "system", "content": personalized_system_prompt},
+                                *openai_messages,
+                            ],
+                            response_format={"type": "json_object"},
+                            temperature=0.4,
                         )
-
-                        conversation_history.append(
-                            {
-                                "role": "assistant",
-                                "content": None,
-                                "tool_calls": [
-                                    {
-                                        "id": tool_call.id,
-                                        "type": "function",
-                                        "function": {
-                                            "name": tool_call.function.name,
-                                            "arguments": tool_call.function.arguments,
-                                        },
-                                    }
-                                ],
-                            }
-                        )
-                        conversation_history.append(
-                            {
-                                "role": "tool",
-                                "tool_call_id": tool_call.id,
-                                "content": json.dumps([p.model_dump() for p in found_products], default=str),
-                            }
-                        )
-
-                        try:
-                            followup = await openai_client.chat.completions.create(
-                                model="gpt-4o-mini",
-                                messages=[
-                                    {"role": "system", "content": personalized_system_prompt},
-                                    *conversation_history,
-                                ],
-                                response_format={"type": "json_object"},
-                                temperature=0.4,
-                            )
-                            raw_content = followup.choices[0].message.content or "{}"
-                            data = json.loads(raw_content)
-                            reply_text = data.get("reply_text", "")
-                            suggested_replies = data.get("suggested_replies", [])
-                            
-                            conversation_history.append({
-                                "role": "assistant", 
-                                "content": json.dumps({
-                                    "reply_text": reply_text, 
-                                    "suggested_replies": suggested_replies
-                                })
-                            })
-                            
-                        except Exception as exc:
-                            logger.error("OpenAI follow-up error", extra={"user_id": user_id, "error": str(exc)})
-                            if found_products:
-                                reply_text = f"Here are some {keyword} options I found for you:"
-                            else:
-                                reply_text = (
-                                    f"Sorry, I couldn't find any '{keyword}' matching your criteria. "
-                                    "Try a broader keyword or adjust your filters."
-                                )
-                            suggested_replies = ["Try a different keyword", "Compare Prices"]
-                            conversation_history.append({"role": "assistant", "content": json.dumps({"reply_text": reply_text, "suggested_replies": suggested_replies})})
-                        break 
-                    else:
-                        reply_text = "I encountered an unexpected issue. Please try again."
-                        conversation_history.append({"role": "assistant", "content": json.dumps({"reply_text": reply_text, "suggested_replies": []})})
+                        raw_content = followup.choices[0].message.content or "{}"
+                        data = json.loads(raw_content)
+                        reply_text = data.get("reply_text", "")
+                        suggested_replies = data.get("suggested_replies", [])
+                        
+                        conversation_history.append({
+                            "role": "assistant", 
+                            "content": reply_text, 
+                            "metadata": {"suggested_replies": suggested_replies}
+                        })
+                        
+                    except Exception as exc:
+                        logger.error("OpenAI follow-up error", extra={"user_id": user_id, "error": str(exc)})
+                        reply_text = f"I found some options for you." if found_products else "I couldn't find exactly what you were looking for."
+                        suggested_replies = ["Show more", "Compare Prices"]
+                        conversation_history.append({
+                            "role": "assistant", 
+                            "content": reply_text,
+                        })
             else:
                 try:
                     raw_content = response_message.content or "{}"
@@ -421,15 +392,17 @@ async def handle_chat_websocket(websocket: WebSocket, token: str | None) -> None
                     suggested_replies = data.get("suggested_replies", [])
                     conversation_history.append({
                         "role": "assistant", 
-                        "content": json.dumps({
-                            "reply_text": reply_text, 
-                            "suggested_replies": suggested_replies
-                        })
+                        "content": reply_text, 
+                        "metadata": {"suggested_replies": suggested_replies}
                     })
                 except Exception:
                     reply_text = response_message.content or ""
                     suggested_replies = []
-                    conversation_history.append({"role": "assistant", "content": json.dumps({"reply_text": reply_text, "suggested_replies": []})})
+                    conversation_history.append({
+                        "role": "assistant", 
+                        "content": reply_text, 
+                        "metadata": {"suggested_replies": []}
+                    })
                 found_products = []
 
             await redis_client.set(history_key, json.dumps(conversation_history), ex=86400)

@@ -1,12 +1,10 @@
 from contextlib import asynccontextmanager
-
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
-
 from app.core import config
 from app.media_api.router import router as media_router
 from app.chat.router import router as chat_router
@@ -15,7 +13,8 @@ from app.core.database import get_db
 from app.core.limiter import redis_client
 from app.core.logger import logger
 from app.media_api.services import MEDIA_ROOT
-
+from app.core.mcp import mcp_server
+from mcp.server.sse import SseServerTransport
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -48,6 +47,17 @@ app.mount(config.FASTAPI_MEDIA_URL, StaticFiles(directory=str(MEDIA_ROOT)), name
 app.include_router(chat_router)
 app.include_router(media_router)
 app.include_router(store_router)
+
+sse = SseServerTransport("/mcp/messages")
+
+@app.get("/mcp/sse")
+async def mcp_sse(request: Request):
+    async with sse.connect_sse(request.scope, request.receive, request._send) as (read_stream, write_stream):
+        await mcp_server.run(read_stream, write_stream, mcp_server.create_initialization_options())
+
+@app.post("/mcp/messages")
+async def mcp_messages(request: Request):
+    await sse.handle_post_request(request.scope, request.receive, request._send)
 
 
 @app.exception_handler(Exception)

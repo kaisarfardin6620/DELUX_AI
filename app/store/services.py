@@ -29,14 +29,46 @@ async def search_products_in_db(
         query = query.where(ProductListing.price >= min_price)
     if condition:
         query = query.where(ProductListing.condition == condition.strip().upper())
-    if free_shipping is True:
-        query = query.where(ProductListing.free_shipping == True)
+    if free_shipping is not None:
+        query = query.where(ProductListing.free_shipping == free_shipping)
 
     query = query.order_by(ProductListing.price.asc()).limit(5)
 
     result = await db.execute(query)
     rows = result.all()
 
+    products = []
+    for prod, listing, platform in rows:
+        products.append(
+            ProductCard(
+                id=prod.id,
+                title=prod.title,
+                image_url=build_image_url(prod.main_image),
+                price=float(listing.price) if listing.price is not None else None,
+                original_price=float(listing.original_price) if listing.original_price is not None else None,
+                discount_percentage=float(listing.discount_percentage) if listing.discount_percentage is not None else None,
+                platform_name=platform.name,
+                external_url=listing.external_url,
+                condition=listing.condition,
+                currency=listing.currency,
+                free_shipping=listing.free_shipping,
+            )
+        )
+    return products
+
+async def get_featured_products(db: AsyncSession, limit: int = 5) -> List[ProductCard]:
+    query = (
+        select(Product, ProductListing, Platform)
+        .join(ProductListing, Product.id == ProductListing.product_id)
+        .join(Platform, ProductListing.platform_id == Platform.id)
+        .where(ProductListing.is_available == True)
+        .where(ProductListing.quantity > 0)
+        .order_by(ProductListing.id.desc())
+        .limit(limit)
+    )
+    result = await db.execute(query)
+    rows = result.all()
+    
     products = []
     for prod, listing, platform in rows:
         products.append(
