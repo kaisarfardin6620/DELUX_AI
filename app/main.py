@@ -27,13 +27,25 @@ async def lifespan(app: FastAPI):
     logger.info("Chatbot service shutting down")
 
 
+import time
+from fastapi.responses import ORJSONResponse
+
 app = FastAPI(
     title="Dealnux Chatbot API",
     version="1.0.0",
     docs_url=None,
     redoc_url=None,
     lifespan=lifespan,
+    default_response_class=ORJSONResponse,
 )
+
+@app.middleware("http")
+async def add_process_time_header(request: Request, call_next):
+    start_time = time.time()
+    response = await call_next(request)
+    process_time = time.time() - start_time
+    response.headers["X-Process-Time"] = f"{process_time:.4f}s"
+    return response
 
 app.add_middleware(
     CORSMiddleware,
